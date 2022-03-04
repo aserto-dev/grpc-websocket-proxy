@@ -1,7 +1,6 @@
 package wsproxy
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,8 +8,11 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 // MethodOverrideParam defines the special URL parameter that is translated into the subsequent proxied streaming http request's method.
@@ -166,11 +168,16 @@ func isClosedConnError(err error) bool {
 
 func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 	var responseHeader http.Header
-	// If Sec-WebSocket-Protocol starts with "Bearer", respond in kind.
-	// TODO(tmc): consider customizability/extension point here.
-	if strings.HasPrefix(r.Header.Get("Sec-WebSocket-Protocol"), "Bearer") {
+	var mapped map[string]string
+	var accepted []string
+
+	if swsp := r.Header.Get("Sec-Websocket-Protocol"); swsp != "" {
+		accepted, mapped = transformSubProtocolHeader(swsp)
+	}
+
+	if len(accepted) > 0 {
 		responseHeader = http.Header{
-			"Sec-WebSocket-Protocol": []string{"Bearer"},
+			"Sec-Websocket-Protocol": accepted,
 		}
 	}
 	conn, err := upgrader.Upgrade(w, r, responseHeader)
@@ -189,9 +196,11 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 		p.logger.Warnln("error preparing request:", err)
 		return
 	}
-	if swsp := r.Header.Get("Sec-WebSocket-Protocol"); swsp != "" {
-		request.Header.Set("Authorization", transformSubProtocolHeader(swsp))
+
+	for k, v := range mapped {
+		request.Header.Set(k, v)
 	}
+
 	for header := range r.Header {
 		if p.headerForwarder(header) {
 			request.Header.Set(header, r.Header.Get(header))
@@ -208,16 +217,16 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 	if p.requestMutator != nil {
 		request = p.requestMutator(r, request)
 	}
-
-	responseBodyR, responseBodyW := io.Pipe()
-	response := newInMemoryResponseWriter(responseBodyW)
+	
+	response := newProtoResponseWriter(conn)
 	go func() {
 		<-ctx.Done()
 		p.logger.Debugln("closing pipes")
-		requestBodyW.CloseWithError(io.EOF)
-		responseBodyW.CloseWithError(io.EOF)
+		requestBodyW.CloseWithError(io.EOF)		
 		response.closed <- true
 	}()
+
+	request = request.WithContext(response.ContextWithProtoWriter(request.Context()))
 
 	go func() {
 		defer cancelFn()
@@ -283,68 +292,103 @@ func (p *Proxy) proxy(w http.ResponseWriter, r *http.Request) {
 			}
 		}()
 	}
-	// write loop -- take messages from response and write to websocket
-	scanner := bufio.NewScanner(responseBodyR)
 
-	// if maxRespBodyBufferSize has been specified, use custom buffer for scanner
-	var scannerBuf []byte
-	if p.maxRespBodyBufferBytes > 0 {
-		scannerBuf = make([]byte, 0, 64*1024)
-		scanner.Buffer(scannerBuf, p.maxRespBodyBufferBytes)
-	}
-
-	for scanner.Scan() {
-		if len(scanner.Bytes()) == 0 {
-			p.logger.Warnln("[write] empty scan", scanner.Err())
-			continue
-		}
-		p.logger.Debugln("[write] scanned", scanner.Text())
-		if err = conn.WriteMessage(websocket.TextMessage, scanner.Bytes()); err != nil {
-			p.logger.Warnln("[write] error writing websocket message:", err)
-			return
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		p.logger.Warnln("scanner err:", err)
-	}
+	<-ctx.Done()
+	p.logger.Debugln("all done here")
 }
 
-type inMemoryResponseWriter struct {
-	io.Writer
+func transformSubProtocolHeader(header string) ([]string, map[string]string) {
+	tokens := strings.Split(header, ",")
+
+	if len(tokens) < 2 {
+		return nil, nil
+	}
+
+	mapped := map[string]string{}
+	accepted := []string{}
+
+	for i, v := range tokens {
+		if i%2 == 0 && len(tokens) > i+1 {
+			switch strings.Trim(v, " ") {
+			case "Bearer":
+				accepted = append(accepted, "Bearer")
+				mapped["Authorization"] = fmt.Sprintf("Bearer %s", strings.Trim(tokens[i+1], " "))
+			case "TenantID":
+				accepted = append(accepted, "TenantID")
+				mapped["Aserto-Tenant-Id"] = strings.Trim(tokens[i+1], " ")
+			}
+		}
+	}
+
+	return accepted, mapped
+}
+
+type ProtoResponseWriter struct {
+	conn   *websocket.Conn
 	header http.Header
 	code   int
 	closed chan bool
 }
 
-func newInMemoryResponseWriter(w io.Writer) *inMemoryResponseWriter {
-	return &inMemoryResponseWriter{
-		Writer: w,
+func newProtoResponseWriter(conn *websocket.Conn) *ProtoResponseWriter {
+	return &ProtoResponseWriter{
+		conn:   conn,
 		header: http.Header{},
 		closed: make(chan bool, 1),
 	}
 }
 
-// IE and Edge do not delimit Sec-WebSocket-Protocol strings with spaces
-func transformSubProtocolHeader(header string) string {
-	tokens := strings.SplitN(header, "Bearer,", 2)
-
-	if len(tokens) < 2 {
-		return ""
-	}
-
-	return fmt.Sprintf("Bearer %v", strings.Trim(tokens[1], " "))
+func (w *ProtoResponseWriter) Write(b []byte) (int, error) {
+	return len(b), nil
 }
 
-func (w *inMemoryResponseWriter) Write(b []byte) (int, error) {
-	return w.Writer.Write(b)
-}
-func (w *inMemoryResponseWriter) Header() http.Header {
+func (w *ProtoResponseWriter) Header() http.Header {
 	return w.header
 }
-func (w *inMemoryResponseWriter) WriteHeader(code int) {
+
+func (w *ProtoResponseWriter) WriteHeader(code int) {
 	w.code = code
 }
-func (w *inMemoryResponseWriter) CloseNotify() <-chan bool {
+
+func (w *ProtoResponseWriter) CloseNotify() <-chan bool {
 	return w.closed
 }
-func (w *inMemoryResponseWriter) Flush() {}
+
+func (w *ProtoResponseWriter) Flush() {
+}
+
+func (w *ProtoResponseWriter) ContextWithProtoWriter(ctx context.Context) context.Context {
+	return context.WithValue(ctx, "proto-writer", w)
+}
+
+func ProtoWriterFromContext(ctx context.Context) *ProtoResponseWriter {
+	pw, ok := ctx.Value("proto-writer").(*ProtoResponseWriter)
+	if !ok {
+		return nil
+	}
+
+	return pw
+}
+
+func ForwardResponse(ctx context.Context, w http.ResponseWriter, msg proto.Message) error {
+	if msg == nil {
+		return nil
+	}
+
+	pw := ProtoWriterFromContext(ctx)
+	if pw == nil {
+		return nil
+	}
+
+	bytes, err := protojson.Marshal(msg)
+	if err != nil {
+		return errors.New("error marshalling proto message to json")
+	}
+
+	err = pw.conn.WriteMessage(websocket.TextMessage, bytes)
+	if err != nil {
+		return errors.New("error writing to reponse")
+	}
+
+	return nil
+}
